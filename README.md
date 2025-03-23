@@ -16,7 +16,7 @@ Use the context menu options via right click on the tray icon.
 
 Light Intensity: 1 (low) or 2 (high)
 
-Timeout Duration: choose the timeout when the keyboard backlight should be switched off 1m, 2m, 5m, 10m, 15m, 30m
+Timeout Duration: choose the timeout when the keyboard backlight should be switched off (1m, 2m, 5m, 10m, 15m, 30m)
 
 Turn On Backlight: turn on the backlight permanently (and deactivate the switch off timer)
 
