@@ -1,10 +1,12 @@
 ﻿using System;
+using System.ComponentModel;
+using System.Diagnostics;
 using System.Drawing;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Timers;
 using System.Windows.Forms;
 using System.IO;
-using Gma.System.MouseKeyHook;
 using Microsoft.Win32;
 
 namespace LenovoBacklightAuto
@@ -12,7 +14,12 @@ namespace LenovoBacklightAuto
     class Program
     {
         private static System.Timers.Timer _timer;
-        private static IKeyboardMouseEvents _globalHook;
+        private static IntPtr _keyboardHook;
+        private static readonly KeyboardHookCallback _keyboardHookCallback = OnKeyboardHook;
+        private const int WhKeyboardLl = 13;
+        private const int WmKeyDown = 0x0100;
+        private const int WmSysKeyDown = 0x0104;
+        private const uint InjectedKeyFlags = 0x10 | 0x02;
         private static bool _isBacklightOn = false;
         private static bool _isTimerActive = true;
         private static object _keyboardControl;
@@ -20,26 +27,34 @@ namespace LenovoBacklightAuto
         static ToolStripMenuItem _activeItem;
         static ToolStripMenuItem[] _timeoutItems;
         static ToolStripMenuItem[] _intensityItems;
-        static int _timeoutDuration = 300000; // Default 5 minutes
-        static readonly int[] _timeoutOptions = { 60000, 120000, 300000, 600000, 900000, 1800000 };
+        static int _timeoutDuration = 600000; // Default 10 minutes
+        static readonly int[] _timeoutOptions = { 5000, 60000, 120000, 300000, 600000, 900000, 1800000 };
         static readonly int[] _intensityOptions = { 1, 2 };
         private static bool _isBacklightManuallyOff = false;
         private static bool _isTempDisabled = false;
+        private static readonly object _stateLock = new object();
+        private static readonly Stopwatch _idleTime = Stopwatch.StartNew();
+        private static MethodInfo _setBacklightStatusMethod;
+        private static MethodInfo _getBacklightStatusMethod;
+        private static bool _backlightErrorReported;
 
+        [STAThread]
         static void Main(string[] args)
         {
             AppDomain.CurrentDomain.AssemblyResolve += ResolveEmbeddedAssembly;
             var coreAssembly = Assembly.Load("Keyboard_Core");
-            var keyboardControlType = coreAssembly.GetType("Keyboard_Core.KeyboardControl");
+            var keyboardControlType = coreAssembly.GetType("Keyboard_Core.KeyboardControl", true);
             _keyboardControl = Activator.CreateInstance(keyboardControlType);
+            _setBacklightStatusMethod = keyboardControlType.GetMethod("SetKeyboardBackLightStatus");
+            _getBacklightStatusMethod = keyboardControlType.GetMethod("GetKeyboardBackLightStatus");
+            if (_setBacklightStatusMethod == null || _getBacklightStatusMethod == null)
+            {
+                throw new MissingMethodException("The keyboard library must support backlight writes and status readback.");
+            }
 
-            _timer = new System.Timers.Timer(_timeoutDuration);
+            _timer = new System.Timers.Timer(1000);
             _timer.Elapsed += OnTimerElapsed;
-            _timer.AutoReset = false;
-
-            _globalHook = Hook.GlobalEvents();
-            _globalHook.MouseDownExt += GlobalHookMouseDownExt;
-            _globalHook.KeyDown += GlobalHookKeyDown;
+            _timer.AutoReset = true;
 
             _notifyIcon = new NotifyIcon();
             using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("Lenovo_Keyboard_Backlight_Control.LenovoBacklightAuto2.ico"))
@@ -97,8 +112,14 @@ namespace LenovoBacklightAuto
 
             _notifyIcon.ContextMenuStrip = contextMenu;
 
+            _keyboardHook = SetWindowsHookEx(WhKeyboardLl, _keyboardHookCallback, GetModuleHandle(null), 0);
+            if (_keyboardHook == IntPtr.Zero)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not install the keyboard activity hook.");
+            }
             SystemEvents.PowerModeChanged += SystemEvents_PowerModeChanged;
 
+            _idleTime.Restart();
             _timer.Start();
             Application.Run();
         }
@@ -107,22 +128,11 @@ namespace LenovoBacklightAuto
         {
             if (e.Mode == PowerModes.Resume)
             {
-                if (!_isBacklightOn && !_isBacklightManuallyOff && !_isTempDisabled)
+                lock (_stateLock)
                 {
-                    SetBacklightLevel(2);
-                    _isBacklightOn = true;
-                }
-                else if (_isTempDisabled)
-                {
+                    _idleTime.Restart();
                     _isTempDisabled = false;
-                    SetBacklightLevel(2);
-                    _isBacklightOn = true;
-                    if (_isTimerActive) _timer.Start();
-                }
-                if (_isTimerActive && !_isBacklightManuallyOff)
-                {
-                    _timer.Stop();
-                    _timer.Start();
+                    SetBacklightLevel(_isBacklightManuallyOff ? 0 : GetSelectedIntensity());
                 }
             }
         }
@@ -146,53 +156,70 @@ namespace LenovoBacklightAuto
             }
         }
 
+        static int GetSelectedIntensity()
+        {
+            return int.Parse(Array.Find(_intensityItems, item => item.Checked).Text);
+        }
+
         static void SetIntensity(int intensity)
         {
-            foreach (var item in _intensityItems)
+            lock (_stateLock)
             {
-                item.Checked = item.Text == $"{intensity}";
-            }
-            if (_isBacklightManuallyOff)
-            {
-                TurnOnBacklightManually();
-            }
-            else
-            {
-                SetBacklightLevel(intensity);
+                foreach (var item in _intensityItems)
+                {
+                    item.Checked = item.Text == $"{intensity}";
+                }
+                if (_isBacklightManuallyOff)
+                {
+                    TurnOnBacklightManually();
+                }
+                else
+                {
+                    _isTempDisabled = false;
+                    _idleTime.Restart();
+                    SetBacklightLevel(intensity);
+                }
             }
         }
 
         static void TempDisableBacklight()
         {
-            SetBacklightLevel(0);
-            _isTempDisabled = true;
-            _timer.Stop();
+            lock (_stateLock)
+            {
+                _isTempDisabled = true;
+                SetBacklightLevel(0);
+            }
         }
 
         static void SetTimeout(int duration)
         {
-            _timeoutDuration = duration;
-            _timer.Interval = _timeoutDuration;
+            lock (_stateLock)
+            {
+                _timeoutDuration = duration;
+                _isTimerActive = true;
+                _activeItem.Text = "Deactivate Timer";
+                _idleTime.Restart();
+            }
         }
 
         static void TurnOffBacklightManually()
         {
-            SetBacklightLevel(0);
-            _isBacklightOn = false;
-            _isBacklightManuallyOff = true;
+            lock (_stateLock)
+            {
+                _isBacklightManuallyOff = true;
+                SetBacklightLevel(0);
+            }
         }
 
         static void TurnOnBacklightManually()
         {
-            int selectedIntensity = Array.Find(_intensityItems, item => item.Checked).Text[0] - '0';
-            SetBacklightLevel(selectedIntensity);
-            _isBacklightOn = true;
-            _isBacklightManuallyOff = false;
-
-            // Deactivate the timer and update the menu item text
-            _isTimerActive = false;
-            _activeItem.Text = "Activate Timer";
-            _timer.Stop();
+            lock (_stateLock)
+            {
+                _isBacklightManuallyOff = false;
+                _isTempDisabled = false;
+                _idleTime.Restart();
+                SetBacklightLevel(GetSelectedIntensity());
+            }
         }
 
         static Assembly ResolveEmbeddedAssembly(object sender, ResolveEventArgs args)
@@ -207,63 +234,155 @@ namespace LenovoBacklightAuto
             }
         }
 
-        static void GlobalHookMouseDownExt(object sender, MouseEventExtArgs e) => HandleActivity();
-        static void GlobalHookKeyDown(object sender, KeyEventArgs e) => HandleActivity();
+        private delegate IntPtr KeyboardHookCallback(int code, IntPtr message, IntPtr data);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KeyboardHookData
+        {
+            public uint VirtualKey;
+            public uint ScanCode;
+            public uint Flags;
+            public uint Time;
+            public UIntPtr ExtraInfo;
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int hookId, KeyboardHookCallback callback, IntPtr module, uint threadId);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UnhookWindowsHookEx(IntPtr hook);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr message, IntPtr data);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string moduleName);
+
+        static IntPtr OnKeyboardHook(int code, IntPtr message, IntPtr data)
+        {
+            if (code >= 0)
+            {
+                var key = Marshal.PtrToStructure<KeyboardHookData>(data);
+                HandleKeyboardInput(message.ToInt32(), key.Flags);
+            }
+
+            return CallNextHookEx(_keyboardHook, code, message, data);
+        }
+
+        static void HandleKeyboardInput(int message, uint flags)
+        {
+            // Ignore software-generated input (including Caffeine), but let Windows receive it.
+            if ((message == WmKeyDown || message == WmSysKeyDown) && (flags & InjectedKeyFlags) == 0)
+            {
+                HandleActivity();
+            }
+        }
 
         static void HandleActivity()
         {
-            if (!_isBacklightOn && !_isBacklightManuallyOff && !_isTempDisabled)
+            lock (_stateLock)
             {
-                SetBacklightLevel(2);
-                _isBacklightOn = true;
-            }
-            else if (_isTempDisabled)
-            {
+                _idleTime.Restart();
+                bool wasTempDisabled = _isTempDisabled;
                 _isTempDisabled = false;
-                SetBacklightLevel(2);
-                _isBacklightOn = true;
-                if (_isTimerActive) _timer.Start();
-            }
-            if (_isTimerActive)
-            {
-                _timer.Stop();
-                _timer.Start();
+                if (!_isBacklightManuallyOff && (!_isBacklightOn || wasTempDisabled || _backlightErrorReported))
+                {
+                    SetBacklightLevel(GetSelectedIntensity());
+                }
             }
         }
 
         static void OnTimerElapsed(object source, ElapsedEventArgs e)
         {
-            SetBacklightLevel(0);
-            _isBacklightOn = false;
+            lock (_stateLock)
+            {
+                if (_isBacklightManuallyOff || _isTempDisabled ||
+                    (_isTimerActive && _idleTime.ElapsedMilliseconds >= _timeoutDuration))
+                {
+                    SetBacklightLevel(0);
+                }
+            }
+        }
+
+        static bool IsBacklightAtLevel(int level)
+        {
+            try
+            {
+                object[] arguments = { -1, null };
+                uint result = (uint)_getBacklightStatusMethod.Invoke(_keyboardControl, arguments);
+                return result == 0 && (int)arguments[0] == level;
+            }
+            catch (TargetInvocationException ex)
+            {
+                ReportBacklightError("Could not read the backlight state: " + (ex.InnerException ?? ex).Message);
+                return false;
+            }
         }
 
         static void SetBacklightLevel(int level)
         {
             try
             {
-                var setBacklightStatusMethod = _keyboardControl.GetType().GetMethod("SetKeyboardBackLightStatus",
-                    BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
-                setBacklightStatusMethod.Invoke(_keyboardControl, new object[] { level, null });
+                // Redundant writes refresh Lenovo's OSD; read failures must not prevent a write.
+                if (!IsBacklightAtLevel(level))
+                {
+                    _setBacklightStatusMethod.Invoke(_keyboardControl, new object[] { level, null });
+                    if (!IsBacklightAtLevel(level))
+                    {
+                        ReportBacklightError("The keyboard did not confirm backlight level " + level + ".");
+                        return;
+                    }
+                }
+
+                _isBacklightOn = level != 0;
+                _backlightErrorReported = false;
             }
-            catch (Exception ex)
+            catch (TargetInvocationException ex)
             {
-                Console.WriteLine("An error occurred: " + ex.Message);
+                ReportBacklightError((ex.InnerException ?? ex).Message);
             }
+        }
+
+        static void ReportBacklightError(string message)
+        {
+            Trace.TraceError("Keyboard backlight control failed: {0}", message);
+            if (!_backlightErrorReported && _notifyIcon != null)
+            {
+                _notifyIcon.ShowBalloonTip(5000, "Lenovo Backlight Auto",
+                    "Backlight control failed. Automatic switch-off will keep retrying. " + message,
+                    ToolTipIcon.Warning);
+            }
+            _backlightErrorReported = true;
         }
 
         static void ToggleTimer()
         {
-            _isTimerActive = !_isTimerActive;
-            _activeItem.Text = _isTimerActive ? "Deactivate Timer" : "Activate Timer";
-            if (_isTimerActive) _timer.Start();
-            else _timer.Stop();
+            lock (_stateLock)
+            {
+                _isTimerActive = !_isTimerActive;
+                _activeItem.Text = _isTimerActive ? "Deactivate Timer" : "Activate Timer";
+                if (_isTimerActive) _idleTime.Restart();
+            }
         }
 
         static void ExitApplication()
         {
-            _globalHook.Dispose();
-            _notifyIcon.Dispose();
-            Environment.Exit(0);
+            lock (_stateLock)
+            {
+                _timer.Stop();
+                _timer.Elapsed -= OnTimerElapsed;
+                _timer.Dispose();
+                SystemEvents.PowerModeChanged -= SystemEvents_PowerModeChanged;
+                if (_keyboardHook != IntPtr.Zero && !UnhookWindowsHookEx(_keyboardHook))
+                {
+                    Trace.TraceError("Could not remove the keyboard activity hook: {0}",
+                        new Win32Exception(Marshal.GetLastWin32Error()).Message);
+                }
+                _keyboardHook = IntPtr.Zero;
+                _notifyIcon.Dispose();
+                Environment.Exit(0);
+            }
         }
     }
 }
